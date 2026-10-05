@@ -1,0 +1,52 @@
+spring:
+  application:
+    name: telecom-bridge-gateway
+  main:
+    banner-mode: off
+  lifecycle:
+    timeout-per-shutdown-phase: 10s
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+diameter:
+  peer-host: ${DIAMETER_PEER_HOST:localhost}
+  peer-port: ${DIAMETER_PEER_PORT:3868}
+  origin-host: ${DIAMETER_ORIGIN_HOST:gw.telecom-bridge.local}
+  origin-realm: ${DIAMETER_ORIGIN_REALM:telecom-bridge.local}
+  destination-realm: ${DIAMETER_DESTINATION_REALM:telecom-bridge.local}
+  destination-host: ${DIAMETER_DESTINATION_HOST:}
+  service-context-id: 32251@3gpp.org
+  connect-timeout: 2s
+  request-timeout: ${DIAMETER_REQUEST_TIMEOUT:1s}
+  watchdog-interval: ${DIAMETER_WATCHDOG_INTERVAL:30s}
+  reconnect-min-delay: 500ms
+  reconnect-max-delay: 30s
+  max-pending-requests: 10000
+  io-threads: 1
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+      group:
+        readiness:
+          include: readinessState,diameterPeer
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+logging:
+  level:
+    root: INFO
+    com.telecombridge: ${GATEWAY_LOG_LEVEL:INFO}
+  pattern:
+    console: "%d{ISO8601} %-5level [%thread] %logger{24} - %msg%n"

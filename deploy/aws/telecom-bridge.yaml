@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Telecom-Bridge REST-to-Diameter gateway on ECS Fargate (ARM64 / Graviton).
+  Internet -> ALB :80 -> gateway tasks :8080 -> (Diameter/TCP via Cloud Map DNS) -> OCS simulator :3868.
+
+Parameters:
+  GatewayImage:
+    Type: String
+    Description: ECR image URI of the gateway (built with `docker build --target gateway`).
+  SimulatorImage:
+    Type: String
+    Description: ECR image URI of the Diameter simulator (built with `docker build --target simulator`).
+  AllowedCidr:
+    Type: String
+    Description: CIDR allowed to reach the load balancer, e.g. your public IP as a.b.c.d/32.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+  GatewayDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+
+Resources:
+  # ------------------------------------------------------------------ network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Ref AWS::StackName }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # ------------------------------------------------------------------ security groups
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP from the allowed CIDR to the ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: !Ref AllowedCidr }
+
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Gateway tasks, HTTP 8080 from the ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup }
+
+  SimulatorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Diameter simulator, TCP 3868 from gateway tasks only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3868, ToPort: 3868, SourceSecurityGroupId: !Ref GatewaySecurityGroup }
+
+  # ------------------------------------------------------------------ service discovery
+  PrivateNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: telecom-bridge.internal
+      Vpc: !Ref Vpc
+
+  SimulatorDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: ocs
+      NamespaceId: !Ref PrivateNamespace
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords: [{ Type: A, TTL: 10 }]
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # ------------------------------------------------------------------ ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref AWS::StackName
+      ClusterSettings: [{ Name: containerInsights, Value: enabled }]
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 14
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  SimulatorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-simulator"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: simulator
+          Image: !Ref SimulatorImage
+          Essential: true
+          PortMappings: [{ ContainerPort: 3868, Protocol: tcp }]
+          Environment:
+            - { Name: SIM_ORIGIN_HOST, Value: ocs.telecom-bridge.internal }
+            - { Name: SIM_ORIGIN_REALM, Value: telecom-bridge.internal }
+            - { Name: SIM_MIN_DELAY_MS, Value: "50" }
+            - { Name: SIM_MAX_DELAY_MS, Value: "100" }
+            - { Name: JAVA_OPTS, Value: "-XX:MaxRAMPercentage=60" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: simulator
+
+  GatewayTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-gateway"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      RuntimePlatform: { CpuArchitecture: ARM64, OperatingSystemFamily: LINUX }
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: gateway
+          Image: !Ref GatewayImage
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          # Every task needs its own Diameter Origin-Host, derived from the task's hostname.
+          EntryPoint: ["sh", "-c"]
+          Command:
+            - 'export DIAMETER_ORIGIN_HOST="gw-$(hostname | cut -d. -f1).telecom-bridge.internal"; exec java $JAVA_OPTS -jar /app/gateway-service.jar'
+          Environment:
+            - { Name: DIAMETER_PEER_HOST, Value: ocs.telecom-bridge.internal }
+            - { Name: DIAMETER_PEER_PORT, Value: "3868" }
+            - { Name: DIAMETER_ORIGIN_REALM, Value: telecom-bridge.internal }
+            - { Name: DIAMETER_DESTINATION_REALM, Value: telecom-bridge.internal }
+            - { Name: JAVA_OPTS, Value: "-XX:MaxRAMPercentage=70 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError" }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: gateway
+
+  SimulatorService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: simulator
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref SimulatorTaskDefinition
+      ServiceRegistries: [{ RegistryArn: !GetAtt SimulatorDiscovery.Arn }]
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED   # needed to pull from ECR without a NAT gateway
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref SimulatorSecurityGroup]
+
+  GatewayService:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpListener, SimulatorService]
+    Properties:
+      ServiceName: gateway
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref GatewayDesiredCount
+      TaskDefinition: !Ref GatewayTaskDefinition
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      LoadBalancers:
+        - ContainerName: gateway
+          ContainerPort: 8080
+          TargetGroupArn: !Ref GatewayTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref GatewaySecurityGroup]
+
+  # ------------------------------------------------------------------ load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref LoadBalancerSecurityGroup]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: "30" }
+
+  GatewayTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      # Liveness, not readiness: if the OCS is down every task would fail readiness and ECS would
+      # needlessly recycle them; instead the gateway stays up and answers 503 until the peer returns.
+      HealthCheckPath: /actuator/health/liveness
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "15" }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GatewayTargetGroup
+
+Outputs:
+  ChargeEndpoint:
+    Description: POST JSON here
+    Value: !Sub "http://${LoadBalancer.DNSName}/api/v1/charge"
+  HealthEndpoint:
+    Value: !Sub "http://${LoadBalancer.DNSName}/actuator/health"
+  ActuatorBase:
+    Description: Pass to the load tester as --metrics-url
+    Value: !Sub "http://${LoadBalancer.DNSName}/actuator"
+  ClusterName:
+    Value: !Ref Cluster
+  LogGroup:
+    Value: !Ref LogGroup

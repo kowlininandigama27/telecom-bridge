@@ -1,0 +1,41 @@
+# Local stack: docker compose up --build
+# then: curl -X POST localhost:8080/api/v1/charge -H 'Content-Type: application/json' -d '{"msisdn":"919876543210"}'
+services:
+  simulator:
+    build:
+      context: .
+      target: simulator
+    image: telecom-bridge/simulator:local
+    environment:
+      SIM_ORIGIN_HOST: ocs.telecom-bridge.local
+      SIM_ORIGIN_REALM: telecom-bridge.local
+      SIM_MIN_DELAY_MS: "50"
+      SIM_MAX_DELAY_MS: "100"
+    ports:
+      - "3868:3868"
+
+  gateway:
+    build:
+      context: .
+      target: gateway
+    image: telecom-bridge/gateway:local
+    depends_on:
+      - simulator
+    environment:
+      DIAMETER_PEER_HOST: simulator
+      DIAMETER_PEER_PORT: "3868"
+      DIAMETER_ORIGIN_HOST: gw.telecom-bridge.local
+      JAVA_OPTS: "-Xms256m -Xmx512m -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+    ports:
+      - "8080:8080"
+
+  # docker compose --profile load run --rm load-tester --url http://gateway:8080/api/v1/charge --tps 100 --total 30000
+  load-tester:
+    profiles: ["load"]
+    build:
+      context: .
+      target: load-tester
+    image: telecom-bridge/load-tester:local
+    depends_on:
+      - gateway
+    command: ["--url", "http://gateway:8080/api/v1/charge", "--report", "/tmp/report.md"]

@@ -1,0 +1,9 @@
+**/build/
+.gradle/
+.idea/
+.git/
+docs/
+deploy/
+scripts/
+*.pcap
+*.md
