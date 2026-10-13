@@ -326,6 +326,11 @@ gateway gracefully. In Wireshark, use the display filter `diameter || http`. The
 CER/CEA comes before the first REST call because the requirements ask for a persistent connection set
 up at startup. Every REST call is then carried on that same connection.
 
+The captured trace is committed as [`transaction_flow.pcap`](transaction_flow.pcap). Wireshark view with
+the `diameter || http` filter:
+
+![Wireshark: CER/CEA, then POST /api/v1/charge mapped to CCR/CCA](docs/pcap/wireshark-transaction-flow.png)
+
 ---
 
 ## 8. Configuration
